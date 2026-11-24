@@ -18,6 +18,13 @@ gotohp.config
 *.log
 *.tmp
 *.bak
+watcher_state.json
+watcher_state.json.tmp
+nul
+
+# Credentials-adjacent local state (contains account token / device fingerprint)
+gotohp.config*
+identity.profile
 
 # OS Metadata
 Thumbs.db

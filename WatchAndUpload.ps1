@@ -35,9 +35,42 @@ if (-not $script:BASE) {
 
 $script:DB = Join-Path $script:BASE "gphotos.db"
 
+# Live heartbeat file. The upload queue only exists in the watcher's memory,
+# so a separate process cannot see it. The running watcher therefore mirrors
+# its state here (which file is being uploaded right now, how far the current
+# scan pass got, which phase it is in) for QueueStatus.ps1 to read.
+$script:STATE_FILE = Join-Path $script:BASE "watcher_state.json"
+$script:stateStartedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+$script:stateTotal = 0
+$script:stateIndex = 0
+
+# Writes (merges) the heartbeat file. Only the fields passed in are replaced,
+# so a light heartbeat never wipes the current-file info written by the
+# uploader itself.
+function Write-WatcherState {
+    param([hashtable]$Fields = @{})
+    try {
+        $state = [ordered]@{}
+        if ([System.IO.File]::Exists($script:STATE_FILE)) {
+            try {
+                $existing = [System.IO.File]::ReadAllText($script:STATE_FILE) | ConvertFrom-Json
+                if ($existing) {
+                    foreach ($prop in $existing.PSObject.Properties) { $state[$prop.Name] = $prop.Value }
+                }
+            } catch {}
+        }
+        $state["pid"]            = $PID
+        $state["started_at"]     = $script:stateStartedAt
+        $state["updated_at"]     = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        foreach ($key in $Fields.Keys) { $state[$key] = $Fields[$key] }
+        [System.IO.File]::WriteAllText($script:STATE_FILE, ($state | ConvertTo-Json -Compress))
+    } catch {}
+}
+
 # Discover gotohp-cli executable
 $script:GOTOHP = $null
 $binCandidates = @(
+    "gotohp-cli-custom.exe",
     "gotohp-cli-x64.exe",
     "gotohp-cli.exe",
     "gotohp-x64.exe",
@@ -83,6 +116,7 @@ function Get-FileHashSafe([string]$path) {
 function Assert-BinaryIntegrity([string]$binPath) {
     if (-not [System.IO.File]::Exists($binPath)) { return }
     $trustedHashes = @{
+        "gotohp-cli-custom.exe"      = "531371f530f977fcdefc464d108ebd3797f4169cab6930f816454d849564b613"
         "gotohp-cli-x64.exe"         = "c272a285a03aeea02a909f0b74d36f84c4a29c235c8dee47f7de75c83f15d2b1"
         "gotohp-x64.exe"             = "5c3f757b9e6b2ffd83934b59274136cf4e67c000265e2eaaa4f34dca6a821088"
         "gotohp-cli_amd64"           = "945021d5dbc36a96f53121eb4f907ace39d9457cea1b43107ed1986441b29030"
@@ -128,6 +162,54 @@ $portableConfig = Join-Path $script:BASE "gotohp.config"
 if ([System.IO.File]::Exists($portableConfig)) {
     $script:CONFIG_ARGS = @("--config", $portableConfig)
     Protect-FileAcl $portableConfig
+}
+
+# Proxy discovery.
+#
+# The CLI only reads credentials from the config file; the proxy must be
+# passed as a flag. A background watcher started from the shell or the
+# Startup folder does not inherit the interactive shell's proxy environment
+# variables, so the proxy is resolved here and handed to every CLI call.
+# Precedence: explicit GOTOHP_PROXY env var > gotohp.config "proxy" >
+# HTTPS_PROXY / HTTP_PROXY environment variables.
+$script:PROXY_ARGS = @()
+$script:PROXY_URL = ""
+try {
+    $proxyFromEnv = ""
+    foreach ($envName in @("GOTOHP_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")) {
+        $v = [Environment]::GetEnvironmentVariable($envName)
+        if (-not [string]::IsNullOrWhiteSpace($v)) { $proxyFromEnv = $v.Trim(); break }
+    }
+
+    $proxyFromConfig = ""
+    if ([System.IO.File]::Exists($portableConfig)) {
+        try {
+            $cfgText = Get-Content $portableConfig -Raw -ErrorAction SilentlyContinue
+            if ($cfgText -match '(?m)^\s*proxy:\s*"([^"]*)"') {
+                $proxyFromConfig = $matches[1].Trim()
+            }
+        } catch {}
+    }
+
+    $proxyCandidate = ""
+    $explicit = [Environment]::GetEnvironmentVariable("GOTOHP_PROXY")
+    if (-not [string]::IsNullOrWhiteSpace($explicit)) {
+        $proxyCandidate = $explicit.Trim()
+    } elseif (-not [string]::IsNullOrWhiteSpace($proxyFromConfig)) {
+        $proxyCandidate = $proxyFromConfig
+    } else {
+        $proxyCandidate = $proxyFromEnv
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($proxyCandidate)) {
+        if ($proxyCandidate -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
+            $proxyCandidate = "http://$proxyCandidate"
+        }
+        $script:PROXY_URL = $proxyCandidate
+        $script:PROXY_ARGS = @("--proxy", $script:PROXY_URL)
+    }
+} catch {
+    $script:PROXY_ARGS = @()
 }
 
 # ---------------------------------------------------------------------
@@ -825,18 +907,31 @@ try {
     $script:MAX_RETRY = 3       # Max retry attempts per file
     $script:LOG_RETENTION_DAYS = 30
     $script:lastUploadSpeed = 2MB  # Adaptive baseline for smooth, realistic progress tracking
-    $script:SWEEP_INTERVAL_SECS = 900  # 15 minutes safety sweep (prevents disk/CPU thrashing, matches Unix daemon)
+    # Safety sweep interval with per-run jitter. A perfectly periodic interval is
+    # a behavioural fingerprint; the jitter also spreads out disk/CPU load.
+    $script:SWEEP_BASE_SECS = 900          # 15 minutes nominal safety sweep
+    $script:SWEEP_JITTER_SECS = 420       # +/- up to 7 minutes of jitter
+    $script:SWEEP_INTERVAL_SECS = $script:SWEEP_BASE_SECS + (Get-Random -Minimum (-$script:SWEEP_JITTER_SECS) -Maximum $script:SWEEP_JITTER_SECS)
     $script:currentUploadProc = $null
 
     # Supported media extensions (photos, camera RAWs, and videos)
     $script:EXT = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    # Aligned with the upload engine's own whitelist (gotohp core/upload.go
+    # supportedFormats). Two classes of mismatch caused wasted work:
+    #   - Extensions the engine does NOT accept (svg/jfif/raw/flv/vob) were
+    #     dropped silently, so the watcher saw no success and retried 3x.
+    #   - Extensions Google rejects at commit (ico) always failed and retried.
+    # The engine also accepts a few formats the watcher never watched
+    # (sr2/asf/divx/m2t/mmv/mod/tod); those are added here so nothing is
+    # silently skipped.
     $extList = @(
         # Standard Photos & Images
-        ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".bmp", ".tiff", ".tif", ".svg", ".ico", ".jfif", ".avif",
+        ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".bmp", ".tiff", ".tif", ".avif",
         # Camera RAW Formats
-        ".dng", ".raw", ".cr2", ".cr3", ".nef", ".arw", ".orf", ".rw2", ".pef", ".srw", ".raf",
+        ".dng", ".cr2", ".cr3", ".nef", ".arw", ".orf", ".rw2", ".pef", ".srw", ".raf", ".sr2",
         # Video Formats
-        ".mp4", ".mov", ".mkv", ".avi", ".m4v", ".3gp", ".3g2", ".wmv", ".webm", ".mpg", ".mpeg", ".mts", ".m2ts", ".ts", ".flv", ".vob"
+        ".mp4", ".mov", ".mkv", ".avi", ".m4v", ".3gp", ".3g2", ".wmv", ".webm", ".mpg", ".mpeg",
+        ".mts", ".m2ts", ".m2t", ".ts", ".asf", ".divx", ".mmv", ".mod", ".tod"
     )
     foreach ($e in $extList) { $script:EXT.Add($e) | Out-Null }
 
@@ -1480,6 +1575,15 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 
         if (-not $script:inFlight.Add($path)) { return }
 
+        # Mirror "what is being uploaded right now" into the heartbeat file so
+        # `status` can show it from another process.
+        Write-WatcherState -Fields @{
+            current_file    = $name
+            current_path    = $path
+            current_size    = [long]$fileInfo.Length
+            current_started = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        }
+
         try {
             $fileSizeMB = [Math]::Round($fileInfo.Length / 1MB, 2)
             if ($fileSizeMB -lt 1) {
@@ -1502,6 +1606,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
                 $prev = 0
                 if ($script:retryMap.ContainsKey($path)) { $prev = $script:retryMap[$path] }
                 Write-Log "File still downloading or locked ($name) - remaining in queue for completion." "WARN"
+                # Do not count a not-ready file as a failed attempt; the
+                # attempt counter is reserved for real upload failures.
                 Save-Retry $path $prev
                 return
             }
@@ -1512,6 +1618,9 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
             $uploadArgs = @()
             if ($script:CONFIG_ARGS.Count -gt 0) {
                 $uploadArgs += $script:CONFIG_ARGS
+            }
+            if ($script:PROXY_ARGS.Count -gt 0) {
+                $uploadArgs += $script:PROXY_ARGS
             }
             $uploadArgs += @("upload", "--no-tui")
             if ($Account) {
@@ -1634,10 +1743,12 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
                 if ($stdout -match '"mediaKey":\s*"([^"]+)"') {
                     $mediaKey = $matches[1]
                 }
-                if ($stdout -match '"error":\s*"([^"]+)"') {
-                    $cliErr = $matches[1]
-                } elseif ($stdout -match '"message":\s*"([^"]+)"') {
-                    $cliErr = $matches[1]
+                # Extract the error field without truncating at an escaped quote:
+                # the CLI emits JSON, so an inner quote must not cut the message.
+                if ($stdout -match '"error":\s*"((?:[^"\\]|\\.)*)"') {
+                    $cliErr = $matches[1] -replace '\\"', '"'
+                } elseif ($stdout -match '"message":\s*"((?:[^"\\]|\\.)*)"') {
+                    $cliErr = $matches[1] -replace '\\"', '"'
                 }
             }
             if (-not $cliErr -and $stderr) {
@@ -1696,6 +1807,12 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
             Write-Log "EXCEPTION for $([System.IO.Path]::GetFileName($path)): $_" "ERROR"
         } finally {
             $null = $script:inFlight.Remove($path)
+            Write-WatcherState -Fields @{
+                current_file    = ""
+                current_path    = ""
+                current_size    = 0
+                current_started = ""
+            }
         }
     }
 
@@ -1712,6 +1829,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         & $script:GOTOHP $script:CONFIG_ARGS creds set $Account 2>&1 | Out-Null
     }
 
+    # The creds subcommand does not accept --proxy; only upload does.
     $listArgs = $script:CONFIG_ARGS + @("creds", "list")
     $credsOutput = & $script:GOTOHP $listArgs 2>&1 | Out-String
 
@@ -1750,6 +1868,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
     }
 
     Initialize-DB
+
     Load-Cache
 
     if ($StatusOnly) {
@@ -1802,6 +1921,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
                 Write-Host "    $qf (attempt $($script:retryMap[$qf]))" -ForegroundColor DarkYellow
             }
         }
+
         Write-Host "==========================================================" -ForegroundColor Cyan
         return
     }
@@ -1850,6 +1970,144 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
     Write-Host "==========================================================" -ForegroundColor Cyan
     Write-Host ""
 
+    # Reset the heartbeat so `status` never reports a stale file from a
+    # previous run.
+    Write-WatcherState -Fields @{
+        phase           = "scanning"
+        index           = 0
+        total           = 0
+        queue_remaining = -1
+        current_file    = ""
+        current_path    = ""
+        current_size    = 0
+        current_started = ""
+    }
+
+    # -----------------------------------------------------------------
+    # 10. PERIODIC MAINTENANCE + MAIN LOOP
+    #
+    # The retry flush and the safety sweep are shared by the startup scan and
+    # the main loop. The startup scan on a large library can run for hours,
+    # so without this the retry queue would stay frozen until it finished.
+    # -----------------------------------------------------------------
+
+    # Flushes the retry queue. Every attempt is synchronous, so only a bounded
+    # number of files is processed per call to keep the caller responsive.
+    function Invoke-RetryFlush([int]$maxFiles = 10) {
+        if ($script:retryMap.Count -eq 0) { return }
+        $processed = 0
+        foreach ($qf in @($script:retryMap.Keys)) {
+            if ($processed -ge $maxFiles) { break }
+            if ($script:inFlight.Contains($qf)) { continue }
+
+            $alreadyUploaded = $script:history.Contains($qf)
+            if (-not $alreadyUploaded) {
+                $dbCheck = Invoke-SqliteQuery -DataSource $script:DB `
+                    -Query "SELECT 1 FROM uploads WHERE path = @p LIMIT 1" `
+                    -SqlParameters @{ p = $qf } -ErrorAction SilentlyContinue
+                if ($dbCheck) {
+                    $alreadyUploaded = $true
+                    Add-ToCache -path $qf
+                }
+            }
+            if ($alreadyUploaded) {
+                Remove-Retry $qf
+                continue
+            }
+            if (-not [System.IO.File]::Exists($qf)) {
+                Remove-Retry $qf
+                continue
+            }
+            Invoke-Upload $qf 1 1
+            $processed++
+        }
+    }
+
+    # Recursive safety sweep over the watched directories.
+    # maxFiles limits how many files are uploaded in one sweep so a large
+    # backlog does not block the main loop for hours.
+    function Invoke-SafetySweep([int]$maxFiles = 0) {
+        $script:SWEEP_INTERVAL_SECS = $script:SWEEP_BASE_SECS + (Get-Random -Minimum (-$script:SWEEP_JITTER_SECS) -Maximum $script:SWEEP_JITTER_SECS)
+        $found = 0
+        foreach ($dir in $script:WATCH_DIRS) {
+            if ($maxFiles -gt 0 -and $found -ge $maxFiles) { break }
+            if (-not [System.IO.Directory]::Exists($dir)) { continue }
+            try {
+                # Collect the candidates first, then upload with a real loop so
+                # the file limit can break out of it. A `return` inside
+                # ForEach-Object only leaves the script block, not the sweep.
+                $candidates = @(
+                    Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction SilentlyContinue |
+                        Where-Object {
+                            -not (Test-IsSymlinkOrJunction $_) -and
+                            (-not $_.Directory -or -not (Test-IsSymlinkOrJunction $_.Directory))
+                        } |
+                        Where-Object { Test-IsEligibleMedia $_ } |
+                        Where-Object { -not (Test-IsDuplicateUpload $_.FullName) }
+                )
+                foreach ($cand in $candidates) {
+                    if ($maxFiles -gt 0 -and $found -ge $maxFiles) { break }
+                    Write-Log "Sweep detected new file: $($cand.Name)" "INFO"
+                    Invoke-Upload $cand.FullName 1 1
+                    $found++
+                }
+            } catch {
+                Write-Log "Sweep error in $dir - $_" "WARN"
+            }
+        }
+        # Clean up memory in long-running background sessions
+        [System.GC]::Collect()
+    }
+
+    # Runs whichever periodic task is due. -force runs the retry flush only,
+    # which is what the startup scan needs between batches.
+    function Invoke-PeriodicMaintenance([switch]$force) {
+        $now = [DateTime]::Now
+
+        # The startup scan (Phase 1) calls this every 20 files, i.e. before the
+        # Phase 2 setup used to initialise these two timestamps. An undefined
+        # value makes `$now - $script:lastX` a terminating error under
+        # $ErrorActionPreference = 'Stop', which silently killed the watcher
+        # after exactly 20 uploads. Seed and re-check them here, and never let
+        # maintenance errors escape.
+        if ($script:lastRetryFlush -isnot [datetime]) { $script:lastRetryFlush = [DateTime]::MinValue }
+        if ($script:lastSweep -isnot [datetime]) { $script:lastSweep = [DateTime]::MinValue }
+
+        try {
+            if (($now - $script:lastRetryFlush).TotalSeconds -ge 30) {
+                $script:lastRetryFlush = $now
+                # A small batch keeps the caller responsive; the startup scan
+                # calls this between batches of its own.
+                if ($force) { Invoke-RetryFlush -maxFiles 3 } else { Invoke-RetryFlush -maxFiles 10 }
+            }
+
+            if (-not $force -and ($now - $script:lastSweep).TotalSeconds -ge $script:SWEEP_INTERVAL_SECS) {
+                $script:lastSweep = $now
+                Invoke-SafetySweep
+            }
+        } catch {
+            Write-Log "Periodic maintenance error (watcher keeps running): $_" "WARN"
+        }
+    }
+
+    # Phase 1 below calls Invoke-PeriodicMaintenance, so these must exist first.
+    $script:lastSweep = [DateTime]::MinValue
+    $script:lastRetryFlush = [DateTime]::MinValue
+
+    # Retry queued files first. They already failed once, so they take
+    # priority over a fresh full scan of never-seen files.
+    if ($script:retryMap.Count -gt 0) {
+        Write-Host "[Phase 0] Flushing $($script:retryMap.Count) retry-queued file(s) first..." -ForegroundColor Cyan
+        $retryGuard = 0
+        while ($script:retryMap.Count -gt 0 -and $retryGuard -lt 500) {
+            $before = $script:retryMap.Count
+            Invoke-RetryFlush -maxFiles 10
+            $retryGuard++
+            if ($script:retryMap.Count -ge $before) { break }
+        }
+        Write-Host "[Phase 0] Retry flush done ($($script:retryMap.Count) still pending)." -ForegroundColor Cyan
+    }
+
     # Phase 1 - Startup scan for unrecorded files
     Write-Host "[Phase 1] Scanning for unrecorded files..." -ForegroundColor Cyan
 
@@ -1883,18 +2141,34 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
     } else {
         $total = $unrecorded.Count
         Write-Host "[Phase 1] Found $total file(s) to upload." -ForegroundColor Yellow
+        $script:stateTotal = $total
+        $script:stateIndex = 0
+        Write-WatcherState -Fields @{ phase = "uploading"; index = 0; total = $total; queue_remaining = $total }
         $i = 0
         foreach ($f in $unrecorded) {
             $i++
+            $script:stateIndex = $i
+            Write-WatcherState -Fields @{ index = $i; total = $total; queue_remaining = ($total - $i) }
             $pct = [Math]::Round(($i / $total) * 100)
             Write-Progress -Activity "Startup sync" -Status "[$i/$total] $($f.Name)" -PercentComplete $pct
             Invoke-Upload $f.FullName $i $total
+
+            # The startup scan can run for hours on a large library. Yield
+            # periodically so the periodic maintenance tasks (retry flush and
+            # safety sweep) still run instead of being starved until the scan
+            # finishes.
+            if (($i % 20) -eq 0) {
+                Invoke-PeriodicMaintenance -force
+            }
         }
         Write-Progress -Activity "Startup sync" -Completed
         Write-Host "[Phase 1] [OK] Startup sync complete ($total file(s))." -ForegroundColor Green
     }
 
     # Phase 2 - Real-time watchers
+    $script:stateTotal = 0
+    $script:stateIndex = 0
+    Write-WatcherState -Fields @{ phase = "watching"; index = 0; total = 0; queue_remaining = 0 }
     Write-Host ""
     Write-Host "[Phase 2] Real-time watcher active." -ForegroundColor Yellow
     Write-Host "  Waiting for new downloads... Press Ctrl+C to stop." -ForegroundColor DarkGray
@@ -1991,66 +2265,18 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         }
     }
 
-    # -----------------------------------------------------------------
-    # 10. MAIN LOOP - Periodic retry flush (30s) + safety sweep (30s)
-    # -----------------------------------------------------------------
-    $lastSweep = [DateTime]::MinValue
-    $lastRetryFlush = [DateTime]::MinValue
+    $script:lastSweep = [DateTime]::MinValue
+    $script:lastRetryFlush = [DateTime]::MinValue
+    $lastHeartbeat = [DateTime]::MinValue
     while ($true) {
         Start-Sleep -Seconds 1
-        $now = [DateTime]::Now
-
-        # Periodic retry queue flush every 30 seconds
-        if (($now - $lastRetryFlush).TotalSeconds -ge 30) {
-            $lastRetryFlush = $now
-            foreach ($qf in @($script:retryMap.Keys)) {
-                $alreadyUploaded = $script:history.Contains($qf)
-                if (-not $alreadyUploaded) {
-                    $dbCheck = Invoke-SqliteQuery -DataSource $script:DB `
-                        -Query "SELECT 1 FROM uploads WHERE path = @p LIMIT 1" `
-                        -SqlParameters @{ p = $qf } -ErrorAction SilentlyContinue
-                    if ($dbCheck) {
-                        $alreadyUploaded = $true
-                        Add-ToCache -path $qf
-                    }
-                }
-                if ($alreadyUploaded) {
-                    Remove-Retry $qf
-                    continue
-                }
-                if ([System.IO.File]::Exists($qf)) {
-                    if (-not $script:inFlight.Contains($qf)) {
-                        Invoke-Upload $qf 1 1
-                    }
-                } else {
-                    Remove-Retry $qf
-                }
-            }
-        }
-
-        # Recursive filesystem safety sweep every 15 minutes ($script:SWEEP_INTERVAL_SECS seconds)
-        if (($now - $lastSweep).TotalSeconds -ge $script:SWEEP_INTERVAL_SECS) {
-            $lastSweep = $now
-            foreach ($dir in $script:WATCH_DIRS) {
-                if (-not [System.IO.Directory]::Exists($dir)) { continue }
-                try {
-                    Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction SilentlyContinue |
-                        Where-Object {
-                            -not (Test-IsSymlinkOrJunction $_) -and
-                            (-not $_.Directory -or -not (Test-IsSymlinkOrJunction $_.Directory))
-                        } |
-                        Where-Object { Test-IsEligibleMedia $_ } |
-                        Where-Object { -not (Test-IsDuplicateUpload $_.FullName) } |
-                        ForEach-Object {
-                            Write-Log "Sweep detected new file: $($_.Name)" "INFO"
-                            Invoke-Upload $_.FullName 1 1
-                        }
-                } catch {
-                    Write-Log "Sweep error in $dir - $_" "WARN"
-                }
-            }
-            # Clean up memory in long-running background sessions
-            [System.GC]::Collect()
+        Invoke-PeriodicMaintenance
+        # Refresh the heartbeat so `status` can tell a live watcher from a stale
+        # state file. Only the cheap fields are touched here; the current-file
+        # fields are owned by Invoke-Upload.
+        if (([DateTime]::Now - $lastHeartbeat).TotalSeconds -ge 10) {
+            $lastHeartbeat = [DateTime]::Now
+            Write-WatcherState -Fields @{ phase = "watching" }
         }
     }
 } finally {
@@ -2092,5 +2318,19 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         if (Get-Command -Name Invoke-SqliteQuery -ErrorAction SilentlyContinue) {
             Write-Log "Watcher stopped cleanly." "INFO"
         }
+    }
+} catch {
+    # Before this, a terminating error shut the watcher down while only logging
+    # the harmless "stopped cleanly" line, which made these deaths invisible.
+    $fatal = $_
+    $where = "unknown"
+    if ($fatal.InvocationInfo -and $fatal.InvocationInfo.ScriptName) {
+        $where = "$(Split-Path -Leaf $fatal.InvocationInfo.ScriptName):$($fatal.InvocationInfo.ScriptLineNumber)"
+    }
+    Write-Host ""
+    Write-Host "FATAL: watcher stopped because of an error at $where" -ForegroundColor Red
+    Write-Host "  $($fatal.Exception.Message)" -ForegroundColor Red
+    if (Get-Command -Name Invoke-SqliteQuery -ErrorAction SilentlyContinue) {
+        Write-Log "FATAL: watcher stopped due to an error at ${where}: $($fatal.Exception.Message)" "ERROR"
     }
 }
