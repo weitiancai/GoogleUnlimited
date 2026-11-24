@@ -35,6 +35,7 @@ echo ==========================================================
 echo   [1] Start Live Watcher (Interactive progress)
 echo   [2] Start Background Watcher (Silent, zero window)
 echo   [3] Check Backup Status
+echo   [12] Show Queue: current upload + pending files
 echo   [4] View Activity Logs
 echo   [5] Enable Auto-Start on Windows Boot   %BOOT_STATUS%
 echo   [6] Disable Auto-Start on Windows Boot
@@ -59,6 +60,7 @@ if "%choice%"=="8" goto manage_folders
 if "%choice%"=="9" goto manage_account
 if "%choice%"=="10" goto force_resync
 if "%choice%"=="11" goto update_app
+if "%choice%"=="12" goto pending_queue
 if "%choice%"=="0" exit /b 0
 echo Invalid option.
 timeout /t 2 >nul 2>&1 || ping -n 3 127.0.0.1 >nul
@@ -73,6 +75,8 @@ if /i "%arg%"=="silent" goto run_silent
 if /i "%arg%"=="bg" goto run_silent
 if /i "%arg%"=="2" goto run_silent
 if /i "%arg%"=="status" goto check_status
+if /i "%arg%"=="queue" goto pending_queue
+if /i "%arg%"=="pending" goto pending_queue
 if /i "%arg%"=="3" goto check_status
 if /i "%arg%"=="logs" goto view_logs
 if /i "%arg%"=="log" goto view_logs
@@ -153,6 +157,12 @@ exit /b 0
 :check_status
 if "%IS_MENU%"=="1" cls
 %PS_CMD% -File "%~dp0WatchAndUpload.ps1" -StatusOnly
+if "%IS_MENU%"=="1" (pause & goto menu)
+exit /b %ERRORLEVEL%
+
+:pending_queue
+if "%IS_MENU%"=="1" cls
+%PS_CMD% -File "%~dp0QueueStatus.ps1" -MaxList 40
 if "%IS_MENU%"=="1" (pause & goto menu)
 exit /b %ERRORLEVEL%
 

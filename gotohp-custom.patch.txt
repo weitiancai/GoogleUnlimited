@@ -1,0 +1,1219 @@
+diff --git a/core/api.go b/core/api.go
+index ec79318..a3ef701 100644
+--- a/core/api.go
++++ b/core/api.go
+@@ -97,11 +97,11 @@ func newAPIFromCredential(credentials string, proxy string) (*Api, error) {
+ 	}
+ 
+ 	api := &Api{
+-		androidAPIVersion: 28,
+-		model:             "Pixel XL",
+-		make:              "Google",
+-		clientVersionCode: 49029607,
+-		language:          params.Get("lang"),
++		androidAPIVersion: IdentityAndroidAPI(),
++		model:             IdentityModel(),
++		make:              IdentityMake(),
++		clientVersionCode: IdentityClientVersionCode(),
++		language:          IdentityLanguage(params.Get("lang")),
+ 		authData:          strings.TrimSpace(credentials),
+ 		client:            client,
+ 		authResponseCache: map[string]string{
+@@ -110,12 +110,7 @@ func newAPIFromCredential(credentials string, proxy string) (*Api, error) {
+ 		},
+ 	}
+ 
+-	api.userAgent = fmt.Sprintf(
+-		"com.google.android.apps.photos/%d (Linux; U; Android 9; %s; %s; Build/PQ2A.190205.001; Cronet/127.0.6510.5) (gzip)",
+-		api.clientVersionCode,
+-		api.language,
+-		api.model,
+-	)
++	api.userAgent = AppUserAgent(api.language)
+ 
+ 	return api, nil
+ }
+@@ -174,7 +169,7 @@ func (a *Api) getAuthToken() (map[string]string, error) {
+ 		"Connection":      "Keep-Alive",
+ 		"Content-Type":    "application/x-www-form-urlencoded",
+ 		"device":          authRequestData.Get("androidId"),
+-		"User-Agent":      "GoogleAuth/1.4 (Pixel XL PQ2A.190205.001); gzip",
++		"User-Agent":      IdentityAuthUserAgent(),
+ 	}
+ 
+ 	req, err := http.NewRequest(
+@@ -520,11 +515,11 @@ func (a *Api) CommitUpload(
+ 	var qualityVal int64 = 3
+ 	if a.saver {
+ 		qualityVal = 1
+-		a.model = "Pixel 2"
++		a.model = IdentitySaverModel()
+ 	}
+ 
+ 	if a.useQuota {
+-		a.model = "Pixel 8"
++		a.model = IdentityQuotaModel()
+ 	}
+ 
+ 	unknownInt := int64(46000000)
+@@ -607,14 +602,15 @@ func (a *Api) doCommitRequest(serializedData []byte) (mediaKey string, retryable
+ 		return "", true, fmt.Errorf("failed to get bearer token: %w", err)
+ 	}
+ 
++	extA, extB := IdentityClientExt()
+ 	headers := map[string]string{
+ 		"accept-Encoding":          "gzip",
+ 		"accept-Language":          a.language,
+ 		"content-Type":             "application/x-protobuf",
+ 		"user-Agent":               a.userAgent,
+ 		"authorization":            "Bearer " + bearerToken,
+-		"x-goog-ext-173412678-bin": "CgcIAhClARgC",
+-		"x-goog-ext-174067345-bin": "CgIIAg==",
++		"x-goog-ext-173412678-bin": extA,
++		"x-goog-ext-174067345-bin": extB,
+ 	}
+ 
+ 	endpoint := a.commitEndpoint
+@@ -711,14 +707,15 @@ func (a *Api) CreateAlbum(albumName string, mediaKeys []string) (string, error)
+ 	}
+ 
+ 	// Prepare headers
++	extA, extB := IdentityClientExt()
+ 	headers := map[string]string{
+ 		"Accept-Encoding":          "gzip",
+ 		"Accept-Language":          a.language,
+ 		"Content-Type":             "application/x-protobuf",
+ 		"User-Agent":               a.userAgent,
+ 		"Authorization":            "Bearer " + bearerToken,
+-		"x-goog-ext-173412678-bin": "CgcIAhClARgC",
+-		"x-goog-ext-174067345-bin": "CgIIAg==",
++		"x-goog-ext-173412678-bin": extA,
++		"x-goog-ext-174067345-bin": extB,
+ 	}
+ 
+ 	// Create the request
+@@ -801,14 +798,15 @@ func (a *Api) AddMediaToAlbum(albumMediaKey string, mediaKeys []string) error {
+ 	}
+ 
+ 	// Prepare headers
++	extA, extB := IdentityClientExt()
+ 	headers := map[string]string{
+ 		"Accept-Encoding":          "gzip",
+ 		"Accept-Language":          a.language,
+ 		"Content-Type":             "application/x-protobuf",
+ 		"User-Agent":               a.userAgent,
+ 		"Authorization":            "Bearer " + bearerToken,
+-		"x-goog-ext-173412678-bin": "CgcIAhClARgC",
+-		"x-goog-ext-174067345-bin": "CgIIAg==",
++		"x-goog-ext-173412678-bin": extA,
++		"x-goog-ext-174067345-bin": extB,
+ 	}
+ 
+ 	// Create the request
+diff --git a/core/configmanager.go b/core/configmanager.go
+index 35431a0..89a2c03 100644
+--- a/core/configmanager.go
++++ b/core/configmanager.go
+@@ -719,9 +719,23 @@ func LoadConfig(path string) error {
+ 	configMu.Lock()
+ 	defer configMu.Unlock()
+ 	ConfigPath = path
++	// A stored identity profile sits next to the config and defines the
++	// device identity this installation presents. Environment variables still
++	// take precedence over the stored profile.
++	applyStoredProfile(path)
+ 	return loadConfigLocked()
+ }
+ 
++// applyStoredProfile loads identity.profile from the config directory and
++// applies it to the process defaults. A missing profile is not an error.
++func applyStoredProfile(configPath string) {
++	p, err := LoadProfile(configPath)
++	if err != nil {
++		return
++	}
++	p.ApplyToDefaults()
++}
++
+ func loadConfigLocked() error {
+ 	if ConfigPath == "" {
+ 		determineConfigPath()
+diff --git a/core/create_media_items.go b/core/create_media_items.go
+index 964f9cd..70b1564 100644
+--- a/core/create_media_items.go
++++ b/core/create_media_items.go
+@@ -58,11 +58,11 @@ func buildLivePhotoCommitPolicy(api *Api) LivePhotoCommitPolicy {
+ 	model := api.model
+ 	if api.saver {
+ 		storagePolicy = 1
+-		model = "Pixel 2"
++		model = IdentitySaverModel()
+ 	}
+ 	// Use Quota selects the current quota-counting device regardless of quality.
+ 	if api.useQuota {
+-		model = "Pixel 8"
++		model = IdentityQuotaModel()
+ 	}
+ 	return LivePhotoCommitPolicy{
+ 		StoragePolicy: storagePolicy,
+diff --git a/core/httpclient.go b/core/httpclient.go
+index 821dc0c..9dbb94d 100644
+--- a/core/httpclient.go
++++ b/core/httpclient.go
+@@ -11,8 +11,15 @@ import (
+ 	"time"
+ )
+ 
++// NewHTTPClientWithProxy creates the HTTP client used for every Google
++// request.
++//
++// When TLS fingerprint emulation is enabled the transport's own proxy
++// handling is disabled and the proxy tunnel is established manually inside
++// the custom TLS dialer. The standard library performs CONNECT and then its
++// own TLS handshake whenever a proxy is configured, which would bypass the
++// emulated ClientHello entirely.
+ func NewHTTPClientWithProxy(proxyURLStr string) (*http.Client, error) {
+-	// Create the base transport with default values
+ 	transport := http.DefaultTransport.(*http.Transport).Clone()
+ 	transport.TLSClientConfig.InsecureSkipVerify = false
+ 
+@@ -22,16 +29,26 @@ func NewHTTPClientWithProxy(proxyURLStr string) (*http.Client, error) {
+ 	transport.MaxConnsPerHost = 10
+ 	transport.IdleConnTimeout = 90 * time.Second
+ 
+-	// Configure proxy if provided
+-	if proxyURLStr != "" {
+-		proxyURL, err := url.Parse(proxyURLStr)
+-		if err != nil {
+-			return nil, err
+-		}
++	// Resolve the effective proxy: an explicit setting wins, otherwise the
++	// standard environment variables are used.
++	proxyURL, err := resolveProxy(proxyURLStr)
++	if err != nil {
++		return nil, err
++	}
++
++	if proxyURLStr != "" && proxyURL != nil {
+ 		transport.Proxy = http.ProxyURL(proxyURL)
+ 		transport.TLSClientConfig.InsecureSkipVerify = true
+ 	}
+ 
++	// Emulate a browser TLS fingerprint so the transport is not trivially
++	// grouped with every other installation of this client.
++	if tlsFingerprintEnabled() {
++		// The dialer establishes the proxy tunnel itself.
++		transport.Proxy = nil
++		applyTLSFingerprint(transport, proxyURL, 30*time.Second)
++	}
++
+ 	client := &http.Client{
+ 		Transport: transport,
+ 		Timeout:   0, // No timeout for large uploads - context handles cancellation
+@@ -40,14 +57,38 @@ func NewHTTPClientWithProxy(proxyURLStr string) (*http.Client, error) {
+ 	return client, nil
+ }
+ 
+-// RetryConfig holds configuration for retry behavior
++// resolveProxy returns the proxy URL to use, or nil when none applies.
++func resolveProxy(proxyURLStr string) (*url.URL, error) {
++	raw := strings.TrimSpace(proxyURLStr)
++	if raw == "" {
++		raw = proxyFromEnvironmentRaw()
++	}
++	if raw == "" {
++		return nil, nil
++	}
++	if !strings.Contains(raw, "://") {
++		raw = "http://" + raw
++	}
++	u, err := url.Parse(raw)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse proxy URL: %w", err)
++	}
++	switch strings.ToLower(u.Scheme) {
++	case "http", "https", "socks5", "socks5h":
++		return u, nil
++	default:
++		return nil, fmt.Errorf("unsupported proxy scheme: %s", u.Scheme)
++	}
++}
++
++// RetryConfig holds configuration for retry behavior.
+ type RetryConfig struct {
+ 	MaxRetries   int
+ 	InitialDelay time.Duration
+ 	MaxDelay     time.Duration
+ }
+ 
+-// DefaultRetryConfig returns sensible defaults for retries
++// DefaultRetryConfig returns sensible defaults for retries.
+ func DefaultRetryConfig() RetryConfig {
+ 	return RetryConfig{
+ 		MaxRetries:   3,
+@@ -56,7 +97,7 @@ func DefaultRetryConfig() RetryConfig {
+ 	}
+ }
+ 
+-// ShouldRetry determines if an HTTP response warrants a retry
++// ShouldRetry determines if an HTTP response warrants a retry.
+ func ShouldRetry(resp *http.Response, err error) bool {
+ 	if err != nil {
+ 		return true // Network errors should be retried
+@@ -68,7 +109,7 @@ func ShouldRetry(resp *http.Response, err error) bool {
+ 	return resp.StatusCode >= 500 || resp.StatusCode == 429
+ }
+ 
+-// CalculateBackoff returns the delay for a given attempt (exponential backoff with jitter)
++// CalculateBackoff returns the delay for a given attempt (exponential backoff with jitter).
+ func CalculateBackoff(attempt int, config RetryConfig) time.Duration {
+ 	delay := config.InitialDelay * time.Duration(1<<uint(attempt))
+ 	if delay > config.MaxDelay {
+@@ -79,7 +120,7 @@ func CalculateBackoff(attempt int, config RetryConfig) time.Duration {
+ 	return delay + jitter
+ }
+ 
+-// CheckResponse validates an HTTP response and returns an error if not successful (2xx)
++// CheckResponse validates an HTTP response and returns an error if not successful (2xx).
+ func CheckResponse(resp *http.Response) error {
+ 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+ 		return nil
+diff --git a/core/identity.go b/core/identity.go
+new file mode 100644
+index 0000000..73c0f13
+--- /dev/null
++++ b/core/identity.go
+@@ -0,0 +1,154 @@
++package core
++
++import (
++	"fmt"
++	"os"
++	"strconv"
++)
++
++// Device identity presented to Google Photos.
++//
++// Upstream hard-codes a single Pixel profile, so every installation of the
++// client looks byte-identical on the wire (User-Agent, protobuf device fields,
++// build fingerprint). The values below are collected in one place so that a
++// build, or a single run, can present a coherent and unique client profile.
++//
++// Build-time overrides (go build -ldflags):
++//
++//	go build -tags cli -ldflags "-X app/core.DefaultDeviceModel=Pixel" -o gotohp-cli.exe .
++//
++// Runtime overrides (environment variables):
++//
++//	GOTOHP_DEVICE_MODEL      device model, e.g. "Pixel" or "Pixel XL"
++//	GOTOHP_DEVICE_MAKE       device manufacturer
++//	GOTOHP_ANDROID_VERSION   human readable Android version in the UA
++//	GOTOHP_ANDROID_API       numeric SDK level in the protobuf
++//	GOTOHP_BUILD             build fingerprint in the UA
++//	GOTOHP_CLIENT_VERSION    Google Photos client version code
++//	GOTOHP_CRONET_VERSION    Cronet build in the UA
++//	GOTOHP_AUTH_UA           User-Agent used for the GoogleAuth token exchange
++//	GOTOHP_LANG              Accept-Language override
++var (
++	// DefaultDeviceModel is the device model reported to Google Photos.
++	// First generation Pixel and Pixel XL keep the permanent "unlimited
++	// original quality" backup entitlement; other models do not.
++	DefaultDeviceModel = "Pixel XL"
++	// DefaultDeviceMake is the device manufacturer reported to Google.
++	DefaultDeviceMake = "Google"
++	// DefaultDeviceAndroidVer is the Android version shown in the app UA.
++	DefaultDeviceAndroidVer = "Android 9"
++	// DefaultDeviceAndroidAPI is the SDK level reported in the protobuf.
++	DefaultDeviceAndroidAPI = "28"
++	// DefaultDeviceBuild is the build fingerprint shown in the app UA.
++	DefaultDeviceBuild = "PQ2A.190205.001"
++	// DefaultClientVersionCode is the Google Photos client version code.
++	DefaultClientVersionCode = "49029607"
++	// DefaultCronetVersion is the Cronet build shown in the app UA.
++	DefaultCronetVersion = "127.0.6510.5"
++	// DefaultGoogleAuthUserAgent is the UA used for the GoogleAuth exchange.
++	DefaultGoogleAuthUserAgent = "GoogleAuth/1.4 (Pixel XL PQ2A.190205.001); gzip"
++	// DefaultLanguage overrides the credential language when not empty.
++	DefaultLanguage = ""
++	// DefaultSaverModel is the model reported when uploading in storage saver
++	// quality. Storage saver uploads always count against the account quota.
++	DefaultSaverModel = "Pixel 2"
++	// DefaultQuotaModel is the model reported when the upload must count
++	// against the account quota.
++	DefaultQuotaModel = "Pixel 8"
++	// DefaultClientExt173412678 and DefaultClientExt174067345 are the opaque
++	// client capability blobs sent with commit requests. They are protocol
++	// semantics rather than fingerprint material, so they keep their upstream
++	// values unless deliberately overridden.
++	DefaultClientExt173412678 = "CgcIAhClARgC"
++	DefaultClientExt174067345 = "CgIIAg=="
++)
++
++// IdentitySaverModel returns the model reported for storage saver uploads.
++func IdentitySaverModel() string {
++	return envOr("GOTOHP_SAVER_MODEL", DefaultSaverModel)
++}
++
++// IdentityQuotaModel returns the model reported for quota counting uploads.
++func IdentityQuotaModel() string {
++	return envOr("GOTOHP_QUOTA_MODEL", DefaultQuotaModel)
++}
++
++// IdentityClientExt returns the opaque client capability blobs sent with
++// commit requests.
++func IdentityClientExt() (string, string) {
++	return envOr("GOTOHP_EXT_173412678", DefaultClientExt173412678),
++		envOr("GOTOHP_EXT_174067345", DefaultClientExt174067345)
++}
++
++func envOr(key, fallback string) string {
++	if v := os.Getenv(key); v != "" {
++		return v
++	}
++	return fallback
++}
++
++// IdentityModel returns the device model reported to Google Photos.
++func IdentityModel() string { return envOr("GOTOHP_DEVICE_MODEL", DefaultDeviceModel) }
++
++// IdentityMake returns the reported device manufacturer.
++func IdentityMake() string { return envOr("GOTOHP_DEVICE_MAKE", DefaultDeviceMake) }
++
++// IdentityAndroidVer returns the Android version shown in the app User-Agent.
++func IdentityAndroidVer() string {
++	return envOr("GOTOHP_ANDROID_VERSION", DefaultDeviceAndroidVer)
++}
++
++// IdentityAndroidAPI returns the SDK level reported in the protobuf payload.
++func IdentityAndroidAPI() int64 {
++	n, err := strconv.ParseInt(envOr("GOTOHP_ANDROID_API", DefaultDeviceAndroidAPI), 10, 64)
++	if err != nil || n <= 0 {
++		n = 28
++	}
++	return n
++}
++
++// IdentityBuild returns the build fingerprint shown in the app User-Agent.
++func IdentityBuild() string { return envOr("GOTOHP_BUILD", DefaultDeviceBuild) }
++
++// IdentityClientVersionCode returns the Google Photos client version code.
++func IdentityClientVersionCode() int64 {
++	n, err := strconv.ParseInt(envOr("GOTOHP_CLIENT_VERSION", DefaultClientVersionCode), 10, 64)
++	if err != nil || n <= 0 {
++		n = 49029607
++	}
++	return n
++}
++
++// IdentityCronetVersion returns the Cronet build shown in the app User-Agent.
++func IdentityCronetVersion() string {
++	return envOr("GOTOHP_CRONET_VERSION", DefaultCronetVersion)
++}
++
++// IdentityAuthUserAgent returns the User-Agent used for the GoogleAuth exchange.
++func IdentityAuthUserAgent() string {
++	return envOr("GOTOHP_AUTH_UA", DefaultGoogleAuthUserAgent)
++}
++
++// IdentityLanguage resolves the Accept-Language sent with every request.
++func IdentityLanguage(credential string) string {
++	if v := os.Getenv("GOTOHP_LANG"); v != "" {
++		return v
++	}
++	if DefaultLanguage != "" {
++		return DefaultLanguage
++	}
++	return credential
++}
++
++// AppUserAgent renders the Google Photos app User-Agent for the active identity.
++func AppUserAgent(language string) string {
++	return fmt.Sprintf(
++		"com.google.android.apps.photos/%d (Linux; U; %s; %s; %s; Build/%s; Cronet/%s) (gzip)",
++		IdentityClientVersionCode(),
++		IdentityAndroidVer(),
++		language,
++		IdentityModel(),
++		IdentityBuild(),
++		IdentityCronetVersion(),
++	)
++}
+diff --git a/core/identity_profile.go b/core/identity_profile.go
+new file mode 100644
+index 0000000..95a2248
+--- /dev/null
++++ b/core/identity_profile.go
+@@ -0,0 +1,225 @@
++package core
++
++import (
++	"fmt"
++	"math/rand"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++// Real Pixel / Pixel XL build fingerprints, so the reported identity stays
++// internally consistent (model, Android version and build must agree).
++// Both Pixel (sailfish) and Pixel XL (marlin) are first generation devices
++// with the permanent original-quality backup entitlement.
++var pixelBuilds = []struct {
++	Model         string
++	AndroidVer    string
++	AndroidAPI    string
++	Build         string
++	CronetVersion string
++}{
++	// Pixel XL (marlin) - Android 9 / 10 / 11
++	{"Pixel XL", "Android 9", "28", "PQ2A.190205.001", "68.0.3440.91"},
++	{"Pixel XL", "Android 9", "28", "PQ3A.190801.002", "70.0.3538.110"},
++	{"Pixel XL", "Android 10", "29", "QQ3A.200805.001", "76.0.3809.132"},
++	{"Pixel XL", "Android 10", "29", "QQ3A.200805.001", "80.0.3987.132"},
++	{"Pixel XL", "Android 11", "30", "RQ3A.211005.007", "85.0.4183.127"},
++	{"Pixel XL", "Android 11", "30", "RQ2A.210505.003", "87.0.4280.141"},
++	// Pixel (sailfish) - Android 9 / 10 / 11
++	{"Pixel", "Android 9", "28", "PQ2A.190205.001", "68.0.3440.91"},
++	{"Pixel", "Android 9", "28", "PQ3A.190801.002", "72.0.3626.121"},
++	{"Pixel", "Android 10", "29", "QQ3A.200805.001", "78.0.3904.108"},
++	{"Pixel", "Android 10", "29", "QQ3A.200805.001", "83.0.4103.116"},
++	{"Pixel", "Android 11", "30", "RQ3A.211005.007", "88.0.4324.150"},
++}
++
++// Realistic Google Photos client version codes. The upstream default is
++// 49029607; alternatives stay in a believable range.
++var clientVersionCodes = []int64{
++	48995415, 49010401, 49029607, 49038112, 49043514,
++	49100411, 49133800, 49175518, 49220104, 49266983,
++}
++
++// Accepted-Language values that match a real device locale.
++var languageProfiles = []string{
++	"zh-CN", "zh-TW", "zh-HK", "en-US", "en-GB", "ja-JP", "ko-KR", "de-DE", "fr-FR", "es-ES",
++}
++
++// TLS fingerprint profiles that can be emulated.
++var tlsFingerprintProfiles = []string{
++	"chrome", "chrome_131", "chrome_120", "chrome_115", "chrome_106",
++	"chrome_102", "chrome_96", "chrome_87",
++	"firefox", "safari", "edge", "android", "ios",
++}
++
++// IdentityProfile is the full device identity one installation presents.
++type IdentityProfile struct {
++	Model          string `koanf:"model"`
++	Make           string `koanf:"make"`
++	AndroidVersion string `koanf:"android_version"`
++	AndroidAPI     string `koanf:"android_api"`
++	Build          string `koanf:"build"`
++	CronetVersion  string `koanf:"cronet_version"`
++	Language       string `koanf:"language"`
++	ClientVersion  int64  `koanf:"client_version"`
++	AuthUserAgent  string `koanf:"auth_user_agent"`
++	TLSFingerprint string `koanf:"tls_fingerprint"`
++	SaverModel     string `koanf:"saver_model"`
++	QuotaModel     string `koanf:"quota_model"`
++	CreatedAt      string `koanf:"created_at"`
++	Seed           int64  `koanf:"seed"`
++}
++
++// RandomIdentity returns a coherent, unique device identity.
++// The model is always a first generation Pixel or Pixel XL, which is what
++// carries the permanent original-quality backup entitlement.
++func RandomIdentity(rnd *rand.Rand) IdentityProfile {
++	p := pixelBuilds[rnd.Intn(len(pixelBuilds))]
++	profile := IdentityProfile{
++		Model:          p.Model,
++		Make:           "Google",
++		AndroidVersion: p.AndroidVer,
++		AndroidAPI:     p.AndroidAPI,
++		Build:          p.Build,
++		CronetVersion:  p.CronetVersion,
++		Language:       languageProfiles[rnd.Intn(len(languageProfiles))],
++		ClientVersion:  clientVersionCodes[rnd.Intn(len(clientVersionCodes))],
++		TLSFingerprint: tlsFingerprintProfiles[rnd.Intn(len(tlsFingerprintProfiles))],
++		SaverModel:     "Pixel 2",
++		QuotaModel:     "Pixel 8",
++	}
++	profile.AuthUserAgent = profile.AuthUserAgentFor()
++	profile.Seed = rnd.Int63()
++	profile.CreatedAt = time.Now().Format(time.RFC3339)
++	return profile
++}
++
++// AuthUserAgentFor renders the GoogleAuth User-Agent for the profile.
++func (p IdentityProfile) AuthUserAgentFor() string {
++	return fmt.Sprintf("GoogleAuth/1.4 (%s %s); gzip", p.Model, p.Build)
++}
++
++// Describe renders the profile for logs and the identity command.
++func (p IdentityProfile) Describe() string {
++	return fmt.Sprintf(
++		"model=%s android=%s(API %s) build=%s cronet=%s client=%d lang=%s tls=%s",
++		p.Model, p.AndroidVersion, p.AndroidAPI, p.Build, p.CronetVersion,
++		p.ClientVersion, p.Language, p.TLSFingerprint,
++	)
++}
++
++// ApplyToDefaults makes the profile the built-in default for this process.
++// Environment variables still take precedence, so a profile can be overridden
++// per run without rebuilding.
++func (p IdentityProfile) ApplyToDefaults() {
++	DefaultDeviceModel = p.Model
++	DefaultDeviceMake = p.Make
++	DefaultDeviceAndroidVer = p.AndroidVersion
++	DefaultDeviceAndroidAPI = p.AndroidAPI
++	DefaultDeviceBuild = p.Build
++	DefaultClientVersionCode = fmt.Sprintf("%d", p.ClientVersion)
++	DefaultCronetVersion = p.CronetVersion
++	DefaultGoogleAuthUserAgent = p.AuthUserAgent
++	DefaultLanguage = p.Language
++	DefaultTLSFingerprint = p.TLSFingerprint
++	DefaultSaverModel = p.SaverModel
++	DefaultQuotaModel = p.QuotaModel
++}
++
++// ProfilePath returns the file that stores the identity profile next to the
++// given config path.
++func ProfilePath(configPath string) string {
++	dir := "."
++	if configPath != "" {
++		dir = filepath.Dir(configPath)
++	}
++	return filepath.Join(dir, "identity.profile")
++}
++
++// LoadProfile reads an identity profile from disk. A missing file is not an
++// error; it simply means the build defaults stay in effect.
++func LoadProfile(configPath string) (*IdentityProfile, error) {
++	path := ProfilePath(configPath)
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	var p IdentityProfile
++	values := parseKeyValues(string(data))
++	p.Model = values["model"]
++	p.Make = values["make"]
++	p.AndroidVersion = values["android_version"]
++	p.AndroidAPI = values["android_api"]
++	p.Build = values["build"]
++	p.CronetVersion = values["cronet_version"]
++	p.Language = values["language"]
++	p.ClientVersion = parseInt64(values["client_version"])
++	p.AuthUserAgent = values["auth_user_agent"]
++	p.TLSFingerprint = values["tls_fingerprint"]
++	p.SaverModel = values["saver_model"]
++	p.QuotaModel = values["quota_model"]
++	p.CreatedAt = values["created_at"]
++	p.Seed = parseInt64(values["seed"])
++	if p.Model == "" {
++		return nil, fmt.Errorf("identity profile is missing the model field")
++	}
++	return &p, nil
++}
++
++// SaveProfile writes an identity profile to disk.
++func SaveProfile(configPath string, p IdentityProfile) error {
++	path := ProfilePath(configPath)
++	var b strings.Builder
++	write := func(k, v string) {
++		b.WriteString(k)
++		b.WriteString("=")
++		b.WriteString(v)
++		b.WriteString("\n")
++	}
++	write("model", p.Model)
++	write("make", p.Make)
++	write("android_version", p.AndroidVersion)
++	write("android_api", p.AndroidAPI)
++	write("build", p.Build)
++	write("cronet_version", p.CronetVersion)
++	write("language", p.Language)
++	write("client_version", fmt.Sprintf("%d", p.ClientVersion))
++	write("auth_user_agent", p.AuthUserAgent)
++	write("tls_fingerprint", p.TLSFingerprint)
++	write("saver_model", p.SaverModel)
++	write("quota_model", p.QuotaModel)
++	write("created_at", p.CreatedAt)
++	write("seed", fmt.Sprintf("%d", p.Seed))
++	return os.WriteFile(path, []byte(b.String()), 0o600)
++}
++
++// parseKeyValues reads a simple key=value file.
++func parseKeyValues(text string) map[string]string {
++	out := map[string]string{}
++	for _, line := range strings.Split(text, "\n") {
++		line = strings.TrimSpace(line)
++		if line == "" || strings.HasPrefix(line, "#") {
++			continue
++		}
++		k, v, ok := strings.Cut(line, "=")
++		if !ok {
++			continue
++		}
++		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
++	}
++	return out
++}
++
++// parseInt64 parses a decimal integer, returning 0 on failure.
++func parseInt64(text string) int64 {
++	var n int64
++	for _, c := range text {
++		if c < '0' || c > '9' {
++			return 0
++		}
++		n = n*10 + int64(c-'0')
++	}
++	return n
++}
+diff --git a/core/tlsfingerprint.go b/core/tlsfingerprint.go
+new file mode 100644
+index 0000000..eedc988
+--- /dev/null
++++ b/core/tlsfingerprint.go
+@@ -0,0 +1,247 @@
++package core
++
++import (
++	"bufio"
++	"context"
++	"crypto/tls"
++	"encoding/base64"
++	"fmt"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"strings"
++	"time"
++
++	utls "github.com/refraction-networking/utls"
++)
++
++// TLS fingerprint emulation.
++//
++// The upstream client uses Go's standard crypto/tls, whose ClientHello
++// produces a JA3/JA4 hash that is identical for every installation of the
++// binary. Emulating a real browser ClientHello makes the transport look like
++// ordinary browser traffic instead of a fleet of identical Go clients.
++//
++// The emulation is best effort: if anything fails the caller falls back to the
++// standard Go TLS stack, so uploads keep working.
++
++// DefaultTLSFingerprint selects the ClientHello profile to emulate.
++var DefaultTLSFingerprint = "chrome"
++
++// TLSFingerprintName returns the effective TLS fingerprint profile name.
++func TLSFingerprintName() string {
++	return envOr("GOTOHP_TLS_FINGERPRINT", DefaultTLSFingerprint)
++}
++
++// tlsFingerprintEnabled reports whether fingerprint emulation is active.
++func tlsFingerprintEnabled() bool {
++	v := strings.ToLower(strings.TrimSpace(TLSFingerprintName()))
++	return v != "" && v != "off" && v != "none" && v != "0"
++}
++
++// chromeHelloID maps a profile name to a uTLS ClientHello ID.
++func chromeHelloID(profile string) (utls.ClientHelloID, bool) {
++	switch strings.ToLower(strings.TrimSpace(profile)) {
++	case "chrome", "":
++		return utls.HelloChrome_Auto, true
++	case "chrome_133", "chrome133":
++		return utls.HelloChrome_133, true
++	case "chrome_131", "chrome131":
++		return utls.HelloChrome_131, true
++	case "chrome_120", "chrome120":
++		return utls.HelloChrome_120, true
++	case "chrome_115", "chrome115":
++		return utls.HelloChrome_115_PQ, true
++	case "chrome_106", "chrome106":
++		return utls.HelloChrome_106_Shuffle, true
++	case "chrome_102", "chrome102":
++		return utls.HelloChrome_102, true
++	case "chrome_96", "chrome96":
++		return utls.HelloChrome_96, true
++	case "chrome_87", "chrome87":
++		return utls.HelloChrome_87, true
++	case "firefox", "firefox_120", "firefox120":
++		return utls.HelloFirefox_120, true
++	case "safari", "safari_16", "safari16":
++		return utls.HelloSafari_16_0, true
++	case "edge", "edge_106", "edge106":
++		return utls.HelloEdge_106, true
++	case "edge_85", "edge85":
++		return utls.HelloEdge_85, true
++	case "android", "android_11", "android11":
++		return utls.HelloAndroid_11_OkHttp, true
++	case "ios", "ios_14", "ios14":
++		return utls.HelloIOS_14, true
++	default:
++		return utls.ClientHelloID{}, false
++	}
++}
++
++// bufferedConn replays bytes that were read ahead while parsing the proxy
++// CONNECT response.
++type bufferedConn struct {
++	net.Conn
++	reader *bufio.Reader
++}
++
++func (c *bufferedConn) Read(p []byte) (int, error) {
++	return c.reader.Read(p)
++}
++
++// proxyFromEnvironmentRaw returns the proxy URL configured through the
++// environment, matching the behaviour of http.ProxyFromEnvironment.
++func proxyFromEnvironmentRaw() string {
++	for _, key := range []string{"HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"} {
++		raw := strings.TrimSpace(os.Getenv(key))
++		if raw != "" {
++			return raw
++		}
++	}
++	return ""
++}
++
++// dialThroughProxy opens a tunnel to targetAddr through an HTTP proxy.
++func dialThroughProxy(ctx context.Context, proxyURL *url.URL, targetAddr string, timeout time.Duration) (net.Conn, error) {
++	proxyAddr := proxyURL.Host
++	if proxyAddr == "" {
++		proxyAddr = proxyURL.Opaque
++	}
++	if proxyURL.Port() == "" {
++		switch strings.ToLower(proxyURL.Scheme) {
++		case "https":
++			proxyAddr = net.JoinHostPort(proxyURL.Hostname(), "443")
++		default:
++			proxyAddr = net.JoinHostPort(proxyURL.Hostname(), "80")
++		}
++	}
++
++	dialer := &net.Dialer{Timeout: timeout}
++	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
++	if err != nil {
++		return nil, err
++	}
++
++	req := &http.Request{
++		Method: http.MethodConnect,
++		URL:    &url.URL{Opaque: targetAddr},
++		Host:   targetAddr,
++		Header: http.Header{},
++	}
++	if user := proxyURL.User; user != nil {
++		password, _ := user.Password()
++		req.Header.Set("Proxy-Authorization", "Basic "+basicAuth(user.Username(), password))
++	}
++
++	if deadline, ok := ctx.Deadline(); ok {
++		_ = conn.SetDeadline(deadline)
++	} else {
++		_ = conn.SetDeadline(time.Now().Add(timeout))
++	}
++
++	if err := req.Write(conn); err != nil {
++		conn.Close()
++		return nil, err
++	}
++
++	br := bufio.NewReader(conn)
++	resp, err := http.ReadResponse(br, req)
++	if err != nil {
++		conn.Close()
++		return nil, err
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		conn.Close()
++		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
++	}
++	_ = conn.SetDeadline(time.Time{})
++
++	return &bufferedConn{Conn: conn, reader: br}, nil
++}
++
++// basicAuth builds a base64 encoded basic auth credential.
++func basicAuth(user, password string) string {
++	return base64.StdEncoding.EncodeToString([]byte(user + ":" + password))
++}
++
++// newFingerprintDialer returns a dialer that performs a uTLS handshake with
++// the selected browser profile, optionally tunnelling through an HTTP proxy.
++func newFingerprintDialer(profile string, proxyURL *url.URL, timeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
++	return func(ctx context.Context, network, addr string) (net.Conn, error) {
++		host, _, err := net.SplitHostPort(addr)
++		if err != nil {
++			return nil, err
++		}
++
++		helloID, ok := chromeHelloID(profile)
++		if !ok {
++			return nil, fmt.Errorf("unsupported TLS fingerprint profile: %s", profile)
++		}
++
++		var rawConn net.Conn
++		if proxyURL != nil {
++			rawConn, err = dialThroughProxy(ctx, proxyURL, addr, timeout)
++		} else {
++			dialer := &net.Dialer{Timeout: timeout}
++			rawConn, err = dialer.DialContext(ctx, network, addr)
++		}
++		if err != nil {
++			return nil, err
++		}
++
++		spec, err := utls.UTLSIdToSpec(helloID)
++		if err != nil {
++			rawConn.Close()
++			return nil, err
++		}
++		// Speak only HTTP/1.1 in ALPN: the connection returned here is not a
++		// *tls.Conn, so the standard library cannot negotiate HTTP/2 on it.
++		for i := range spec.Extensions {
++			if alpn, ok := spec.Extensions[i].(*utls.ALPNExtension); ok {
++				alpn.AlpnProtocols = []string{"http/1.1"}
++			}
++		}
++
++		uconn := utls.UClient(rawConn, &utls.Config{
++			ServerName: host,
++			MinVersion: tls.VersionTLS12,
++		}, utls.HelloCustom)
++
++		if err := uconn.ApplyPreset(&spec); err != nil {
++			rawConn.Close()
++			return nil, err
++		}
++		if err := uconn.HandshakeContext(ctx); err != nil {
++			rawConn.Close()
++			return nil, err
++		}
++		state := uconn.ConnectionState()
++		if !state.HandshakeComplete || len(state.PeerCertificates) == 0 {
++			rawConn.Close()
++			return nil, fmt.Errorf("TLS handshake did not complete")
++		}
++		return uconn, nil
++	}
++}
++
++// applyTLSFingerprint installs the fingerprint dialer on the transport when
++// emulation is enabled. The standard TLSClientConfig is kept so certificate
++// verification still happens, and any failure falls back to the stock stack.
++func applyTLSFingerprint(transport *http.Transport, proxyURL *url.URL, timeout time.Duration) {
++	if !tlsFingerprintEnabled() {
++		return
++	}
++	profile := TLSFingerprintName()
++	dialTLS := newFingerprintDialer(profile, proxyURL, timeout)
++
++	transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
++		conn, err := dialTLS(ctx, network, addr)
++		if err == nil {
++			return conn, nil
++		}
++		// Fall back to the standard Go TLS stack so uploads keep working.
++		d := &tls.Dialer{Config: transport.TLSClientConfig, NetDialer: &net.Dialer{Timeout: timeout}}
++		return d.DialContext(ctx, network, addr)
++	}
++}
+diff --git a/core/upload.go b/core/upload.go
+index 39a0295..3551738 100644
+--- a/core/upload.go
++++ b/core/upload.go
+@@ -6,11 +6,13 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
++	"math/rand"
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
+ 	"strings"
+ 	"sync"
++	"time"
+ )
+ 
+ // FilesDroppedEvent is emitted when files are dropped on any drop zone
+@@ -196,6 +198,10 @@ func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
+ 		m.reporter.TotalBytes(totalBytes)
+ 	}()
+ 
++	// Shuffle the work order. A fixed ordering is a strong behavioural
++	// fingerprint across installations of this client.
++	shuffleWorkItems(workItems)
++
+ 	// Don't start more threads than files to process
+ 	numWorkers := min(opts.Threads, len(workItems))
+ 
+@@ -684,6 +690,46 @@ func uploadSingleFile(ctx context.Context, api *Api, filePath string, opts Uploa
+ 	return mediaKey, nil
+ }
+ 
++// shuffleWorkItems randomises the upload order.
++func shuffleWorkItems(items []UploadWorkItem) {
++	if len(items) < 2 {
++		return
++	}
++	rand.Shuffle(len(items), func(i, j int) {
++		items[i], items[j] = items[j], items[i]
++	})
++}
++
++// interUploadDelay returns a randomised pause before the next upload so the
++// request pattern does not look machine generated.
++func interUploadDelay() time.Duration {
++	base := envInt("GOTOHP_UPLOAD_DELAY_MIN_MS", 800)
++	spread := envInt("GOTOHP_UPLOAD_DELAY_JITTER_MS", 2400)
++	if base <= 0 && spread <= 0 {
++		return 0
++	}
++	if spread < 0 {
++		spread = 0
++	}
++	return time.Duration(base+rand.Intn(spread+1)) * time.Millisecond
++}
++
++// envInt reads a non-negative integer environment variable.
++func envInt(key string, fallback int) int {
++	v := strings.TrimSpace(os.Getenv(key))
++	if v == "" {
++		return fallback
++	}
++	n := 0
++	for _, c := range v {
++		if c < '0' || c > '9' {
++			return fallback
++		}
++		n = n*10 + int(c-'0')
++	}
++	return n
++}
++
+ func (m *UploadManager) runWorker(workerID int, workChan <-chan UploadWorkItem, results chan<- FileUploadResult, opts UploadOptions) {
+ 	defer m.wg.Done()
+ 	cancel := m.getCancelChan()
+@@ -707,6 +753,16 @@ func (m *UploadManager) runWorker(workerID int, workChan <-chan UploadWorkItem,
+ 	}
+ 
+ 	for item := range workChan {
++		select {
++		case <-cancel:
++			m.reporter.ThreadStatus(ThreadStatus{
++				WorkerID: workerID,
++				Status:   "idle",
++				Message:  "Cancelled",
++			})
++			return
++		case <-time.After(interUploadDelay()):
++		}
+ 		select {
+ 		case <-cancel:
+ 			m.reporter.ThreadStatus(ThreadStatus{
+diff --git a/go.mod b/go.mod
+index 0209d09..817e0c6 100644
+--- a/go.mod
++++ b/go.mod
+@@ -21,6 +21,7 @@ require (
+ 
+ require (
+ 	github.com/adrg/xdg v0.5.3 // indirect
++	github.com/andybalholm/brotli v1.0.6 // indirect
+ 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
+ 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
+ 	github.com/charmbracelet/harmonica v0.2.0 // indirect
+@@ -38,6 +39,7 @@ require (
+ 	github.com/godbus/dbus/v5 v5.2.2 // indirect
+ 	github.com/google/uuid v1.6.0 // indirect
+ 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
++	github.com/klauspost/compress v1.18.3 // indirect
+ 	github.com/knadh/koanf/maps v0.1.3 // indirect
+ 	github.com/lucasb-eyer/go-colorful v1.4.1 // indirect
+ 	github.com/mattn/go-colorable v0.1.15 // indirect
+@@ -50,6 +52,7 @@ require (
+ 	github.com/muesli/cancelreader v0.2.2 // indirect
+ 	github.com/muesli/termenv v0.16.0 // indirect
+ 	github.com/ncruces/go-strftime v1.0.0 // indirect
++	github.com/refraction-networking/utls v1.8.2 // indirect
+ 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+ 	github.com/rivo/uniseg v0.4.7 // indirect
+ 	github.com/xo/terminfo v1.2.0 // indirect
+diff --git a/go.sum b/go.sum
+index 858f28e..5bc8b4e 100644
+--- a/go.sum
++++ b/go.sum
+@@ -1,5 +1,7 @@
+ github.com/adrg/xdg v0.5.3 h1:xRnxJXne7+oWDatRhR1JLnvuccuIeCoBu2rtuLqQB78=
+ github.com/adrg/xdg v0.5.3/go.mod h1:nlTsY+NNiCBGCK2tpm09vRqfVzrc2fLmXGpBLF0zlTQ=
++github.com/andybalholm/brotli v1.0.6 h1:Yf9fFpf49Zrxb9NlQaluyE92/+X7UVHlhMNJN2sxfOI=
++github.com/andybalholm/brotli v1.0.6/go.mod h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig=
+ github.com/aymanbagabas/go-osc52/v2 v2.0.1 h1:HwpRHbFMcZLEVr42D4p7XBqjyuxQH5SMiErDT4WkJ2k=
+ github.com/aymanbagabas/go-osc52/v2 v2.0.1/go.mod h1:uYgXzlJ7ZpABp8OJ+exZzJJhRNQ2ASbcXHWsFqH8hp8=
+ github.com/c2sp/wycheproof v0.0.0-20260105152342-fca0d3ba9f12 h1:C34LW7dhWgjAaAOdNB8z2UCyJsXDjC6UTILljHuqOlI=
+@@ -55,6 +57,8 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
+ github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
+ github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
+ github.com/inconshreveable/mousetrap v1.1.0/go.mod h1:vpF70FUmC8bwa3OWnCshd2FqLfsEA9PFc4w1p2J65bw=
++github.com/klauspost/compress v1.18.3 h1:9PJRvfbmTabkOX8moIpXPbMMbYN60bWImDDU7L+/6zw=
++github.com/klauspost/compress v1.18.3/go.mod h1:R0h/fSBs8DE4ENlcrlib3PsXS61voFxhIs2DeRhCvJ4=
+ github.com/knadh/koanf/maps v0.1.3 h1:P1z7EvTqdFBrPYbzSvorvrpib+sjkUMxf0FVvA5NKK4=
+ github.com/knadh/koanf/maps v0.1.3/go.mod h1:npD/QZY3V6ghQDdcQzl1W4ICNVTkohC8E73eI2xW4yI=
+ github.com/knadh/koanf/parsers/yaml v1.1.1 h1:u70vV5IyaM0HvONh8HoqBC97oTgO33KcpZbTLiKVinU=
+@@ -91,6 +95,8 @@ github.com/ncruces/go-strftime v1.0.0 h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOF
+ github.com/ncruces/go-strftime v1.0.0/go.mod h1:Fwc5htZGVVkseilnfgOVb9mKy6w1naJmn9CehxcKcls=
+ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
+ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/refraction-networking/utls v1.8.2 h1:j4Q1gJj0xngdeH+Ox/qND11aEfhpgoEvV+S9iJ2IdQo=
++github.com/refraction-networking/utls v1.8.2/go.mod h1:jkSOEkLqn+S/jtpEHPOsVv/4V4EVnelwbMQl4vCWXAM=
+ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
+ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
+ github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
+diff --git a/internal/cli/cli.go b/internal/cli/cli.go
+index e628d20..e7c1382 100644
+--- a/internal/cli/cli.go
++++ b/internal/cli/cli.go
+@@ -37,7 +37,7 @@ func IsCLIInvocation(args []string) bool {
+ 		case strings.HasPrefix(arg, "-"):
+ 			return false
+ 		default:
+-			return slices.Contains([]string{"upload", "credentials", "creds", "help", "version"}, arg)
++			return slices.Contains([]string{"upload", "credentials", "creds", "identity", "help", "version"}, arg)
+ 		}
+ 	}
+ 	return false
+@@ -79,7 +79,7 @@ func newRootCommand(info Info) *cobra.Command {
+ 	}
+ 	root.SetVersionTemplate("gotohp v{{.Version}}\n")
+ 	root.PersistentFlags().StringP("config", "c", "", "path to config file")
+-	root.AddCommand(newUploadCommand(), newCredentialsCommand(), &cobra.Command{
++	root.AddCommand(newUploadCommand(), newCredentialsCommand(), newIdentityCommand(), &cobra.Command{
+ 		Use:   "version",
+ 		Short: "Show version information",
+ 		Args:  cobra.NoArgs,
+diff --git a/internal/cli/identity.go b/internal/cli/identity.go
+new file mode 100644
+index 0000000..d30db19
+--- /dev/null
++++ b/internal/cli/identity.go
+@@ -0,0 +1,116 @@
++package cli
++
++import (
++	"fmt"
++	"math/rand"
++	"time"
++
++	"app/core"
++
++	"github.com/spf13/cobra"
++)
++
++// newIdentityCommand manages the emulated device identity.
++//
++// The upstream client hard-codes one Pixel profile, so every installation
++// looks identical on the wire. This command generates and stores a unique,
++// internally consistent profile per installation.
++func newIdentityCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "identity",
++		Short: "Show or generate the emulated device identity used for uploads",
++		Args:  cobra.NoArgs,
++		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
++			configPath, _ := cmd.Flags().GetString("config")
++			// LoadConfig applies the stored identity profile to the defaults.
++			return core.LoadConfig(configPath)
++		},
++		RunE: func(cmd *cobra.Command, _ []string) error {
++			return showIdentity(cmd)
++		},
++	}
++
++	gen := &cobra.Command{
++		Use:   "generate",
++		Short: "Generate a new unique device identity and store it next to the config",
++		Args:  cobra.NoArgs,
++		RunE: func(cmd *cobra.Command, _ []string) error {
++			return generateIdentity(cmd)
++		},
++	}
++	gen.Flags().Int64("seed", 0, "deterministic seed (0 picks a random one)")
++	gen.Flags().String("model", "", "force a device model: Pixel or Pixel XL")
++	gen.Flags().String("tls", "", "force a TLS fingerprint profile, e.g. chrome_131")
++	gen.Flags().String("lang", "", "force the Accept-Language value, e.g. zh-CN")
++
++	cmd.AddCommand(gen)
++	return cmd
++}
++
++func showIdentity(cmd *cobra.Command) error {
++	configPath, _ := cmd.Flags().GetString("config")
++	if p, err := core.LoadProfile(configPath); err == nil {
++		fmt.Println("Stored profile:")
++		fmt.Println("  " + p.Describe())
++		fmt.Println("  auth user-agent : " + p.AuthUserAgent)
++		fmt.Println("  profile file    : " + core.ProfilePath(configPath))
++		fmt.Println()
++	}
++	fmt.Println("Effective identity:")
++	fmt.Printf("  device model    : %s\n", core.IdentityModel())
++	fmt.Printf("  device make     : %s\n", core.IdentityMake())
++	fmt.Printf("  android version : %s (API %d)\n", core.IdentityAndroidVer(), core.IdentityAndroidAPI())
++	fmt.Printf("  build           : %s\n", core.IdentityBuild())
++	fmt.Printf("  client version  : %d\n", core.IdentityClientVersionCode())
++	fmt.Printf("  cronet          : %s\n", core.IdentityCronetVersion())
++	fmt.Printf("  language        : %s\n", core.IdentityLanguage(""))
++	fmt.Printf("  app user-agent  : %s\n", core.AppUserAgent(core.IdentityLanguage("")))
++	fmt.Printf("  googleauth ua   : %s\n", core.IdentityAuthUserAgent())
++	fmt.Printf("  tls fingerprint : %s\n", core.TLSFingerprintName())
++	return nil
++}
++
++func generateIdentity(cmd *cobra.Command) error {
++	configPath, _ := cmd.Flags().GetString("config")
++	seed, _ := cmd.Flags().GetInt64("seed")
++	forcedModel, _ := cmd.Flags().GetString("model")
++	forcedTLS, _ := cmd.Flags().GetString("tls")
++	forcedLang, _ := cmd.Flags().GetString("lang")
++
++	if seed == 0 {
++		seed = time.Now().UnixNano()
++	}
++	rnd := rand.New(rand.NewSource(seed))
++	profile := core.RandomIdentity(rnd)
++
++	if forcedModel != "" {
++		profile.Model = forcedModel
++		profile.AuthUserAgent = profile.AuthUserAgentFor()
++	}
++	if forcedTLS != "" {
++		profile.TLSFingerprint = forcedTLS
++	}
++	if forcedLang != "" {
++		profile.Language = forcedLang
++	}
++
++	if err := core.SaveProfile(configPath, profile); err != nil {
++		return fmt.Errorf("saving identity profile: %w", err)
++	}
++
++	fmt.Println("Generated a new device identity:")
++	fmt.Println("  " + profile.Describe())
++	fmt.Println("  auth user-agent : " + profile.AuthUserAgent)
++	fmt.Println("  profile file    : " + core.ProfilePath(configPath))
++	fmt.Println("  seed            : " + fmt.Sprint(profile.Seed))
++	fmt.Println()
++	fmt.Println("This profile is used automatically on the next run.")
++	return nil
++}
++
++// ensureProfileLoaded applies a stored profile to the process defaults.
++func ensureProfileLoaded(configPath string) {
++	if p, err := core.LoadProfile(configPath); err == nil {
++		p.ApplyToDefaults()
++	}
++}
