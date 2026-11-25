@@ -1,7 +1,7 @@
 # macOS 端改造指南：把 gotohp 定制为"独一份"的客户端
 
 > 面向对象：在 macOS 上执行本改造的 agent / 工程师
-> 参考实现：Windows 端已完成并验证（`C:\Users\17119\GoogleUnlimited`）
+> 参考实现：Windows 端已完成并验证（`<安装目录>`）
 > 目标仓库：`https://github.com/shishir0x/gotohp`（上传引擎） + `https://github.com/shishir0x/GoogleUnlimited`（watcher 壳）
 > 文档版本：2026-11-24（第二轮修正）
 
